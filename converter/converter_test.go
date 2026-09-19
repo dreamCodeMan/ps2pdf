@@ -3,6 +3,7 @@ package converter
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -117,5 +118,18 @@ func TestResolveAndPatchImagePaths(t *testing.T) {
 	}
 	if !bytes.Contains(patched, []byte(imgPath)) {
 		t.Errorf("patched content does not contain real image path")
+	}
+}
+
+func TestPrepareCmdPlatform(t *testing.T) {
+	cmd := exec.Command("echo", "test")
+	prepareCmdPlatform(cmd)
+	// Verification that prepareCmdPlatform executes without panic
+}
+
+func TestFindGS(t *testing.T) {
+	gs := FindGS()
+	if gs == "" {
+		t.Errorf("expected non-empty Ghostscript path/command")
 	}
 }

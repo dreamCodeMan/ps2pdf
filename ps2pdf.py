@@ -31,6 +31,19 @@ import pikepdf
 
 def find_gs():
     """查找系统中 Ghostscript 的可执行路径"""
+    if sys.platform == 'win32':
+        for name in ['gswin64c', 'gswin32c', 'gs']:
+            which = shutil.which(name)
+            if which:
+                return which
+        import glob
+        for pf in [os.environ.get('ProgramFiles', 'C:\\Program Files'),
+                   os.environ.get('ProgramFiles(x86)', 'C:\\Program Files (x86)')]:
+            matches = glob.glob(os.path.join(pf, 'gs', 'gs*', 'bin', 'gswin*c.exe'))
+            if matches:
+                return matches[-1]
+        return 'gswin64c'
+
     for p in ['/opt/homebrew/bin/gs', '/usr/local/bin/gs']:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
@@ -270,7 +283,11 @@ def main():
             f'-sOutputFile={base_pdf}',
             fixed_ps,
         ]
-        res = subprocess.run(gs_cmd, capture_output=True, text=True)
+        run_kwargs = {}
+        if sys.platform == 'win32':
+            # 隐藏 Windows 下运行 Ghostscript 时弹出的 CMD 控制台黑窗口
+            run_kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+        res = subprocess.run(gs_cmd, capture_output=True, text=True, **run_kwargs)
         if res.returncode != 0:
             print("GS 错误:\n", res.stdout[-1000:])
             sys.exit(1)

@@ -186,6 +186,8 @@ func main() {
 ps2pdf/
 ├── converter/              # 核心类库 (package converter)
 │   ├── converter.go        # Converter 结构体、Option 模式、调度主流程
+│   ├── cmd_windows.go      # Windows 专属平台实现（隐藏 Ghostscript 黑窗口、探测 gswin64c）
+│   ├── cmd_other.go        # Unix/macOS/Linux 平台实现
 │   ├── psparser.go         # PS 解析、图片路径智能模糊匹配、DownLoadCode 提取
 │   ├── pdfmod.go           # 流安全 PDF 解析、ToUnicode 注入、字宽与 CMYK 修复
 │   ├── cmap.go             # 符合 Adobe 规范的 ToUnicode CMap 生成器
@@ -195,6 +197,19 @@ ps2pdf/
 ├── go.sum                  # 依赖校验
 └── README.md               # 项目使用说明文档
 ```
+
+### Windows 编译与运行说明
+
+- **标准命令行版（默认）**：
+  ```bash
+  go build -o ps2pdf.exe .
+  ```
+  在终端中正常输出日志。执行 Ghostscript 渲染时已内置设置 `CREATE_NO_WINDOW` 与 `HideWindow`，**不会额外弹窗或闪烁 CMD 黑窗口**。
+- **完全静默无窗口版（适合 GUI/自动化后台调用）**：
+  ```bash
+  go build -ldflags="-H windowsgui" -o ps2pdf.exe .
+  ```
+  双击运行时完全不会出现任何 CMD 控制台黑窗口。
 
 ---
 

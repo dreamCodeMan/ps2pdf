@@ -82,19 +82,7 @@ func WithKeepTempFiles(keep bool) Option {
 
 // FindGS 寻找系统中 Ghostscript 的路径
 func FindGS() string {
-	candidates := []string{
-		"/opt/homebrew/bin/gs",
-		"/usr/local/bin/gs",
-	}
-	for _, c := range candidates {
-		if fi, err := os.Stat(c); err == nil && !fi.IsDir() {
-			return c
-		}
-	}
-	if p, err := exec.LookPath("gs"); err == nil {
-		return p
-	}
-	return "gs"
+	return findPlatformGS()
 }
 
 // New 创建一个新的 Converter 实例
@@ -148,6 +136,7 @@ func (c *Converter) RenderBasePDF(ctx context.Context, fixedPSPath, basePDFPath 
 	}
 
 	cmd := exec.CommandContext(ctx, c.gsPath, gsArgs...)
+	prepareCmdPlatform(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
