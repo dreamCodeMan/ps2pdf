@@ -65,15 +65,18 @@ func DecodeGBKOrLatin1(data []byte) string {
 func ResolveAndPatchImagePaths(psData []byte, searchDir string) ([]byte, PatchReport) {
 	var report PatchReport
 
-	// 1. 禁用 /psdefine 反盗版检查
+	// 1. 禁用 /psdefine 反盗版检查（彻底覆盖自带 prolog 的单机发排 PS 文件）
 	idx1 := bytes.Index(psData, []byte("/psdefine"))
 	if idx1 != -1 {
 		idx2 := bytes.Index(psData[idx1:], []byte("} bd"))
-		if idx2 != -1 {
+		if idx2 == -1 {
+			idx2 = bytes.Index(psData[idx1:], []byte("} def"))
+		}
+		if idx2 != -1 && idx2 < 1500 {
 			idx2End := idx1 + idx2 + 4
 			newPS := make([]byte, 0, len(psData))
 			newPS = append(newPS, psData[:idx1]...)
-			newPS = append(newPS, []byte("/psdefine { } bd")...)
+			newPS = append(newPS, []byte("/psdefine { } bd\n")...)
 			newPS = append(newPS, psData[idx2End:]...)
 			psData = newPS
 			report.PsdefinePatched = true
@@ -255,7 +258,7 @@ func BuildCharMappingFromReader(r io.Reader) (map[string]map[byte]string, error)
 	mapping := make(map[string]map[byte]string)
 
 	reFont := regexp.MustCompile(`(DLF-[0-9]+-[0-9]+-[0-9]+)`)
-	reMatch := regexp.MustCompile(`\((.*?)\)\s*\[[^\]]*\]\s*\d+\s*(?:fxs|fys|VT)`)
+	reMatch := regexp.MustCompile(`\((.*?)\)(?:\s*\[[^\]]*\]\s*\d+)?\s*(?:fxs|fys|VT|fsw|sw|show)`)
 
 	scanner := bufio.NewScanner(r)
 	buf := make([]byte, 1024*1024)

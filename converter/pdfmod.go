@@ -168,12 +168,8 @@ func PostProcessPDFBytes(pdfData []byte, mapping map[string]map[byte]string) ([]
 				streamPart = obj.Body[streamIdx:]
 			}
 
-			// 如果字典中已有 /Decode 则替换，否则插入
-			if reDecode.Match(dictPart) {
-				dictPart = reDecode.ReplaceAll(dictPart, []byte("/Decode [ 1 0 1 0 1 0 1 0 ]"))
-				obj.Body = append(dictPart, streamPart...)
-				result.FixedCMYK++
-			} else {
+			// 检查是否是 CMYK XObject 图片（Adobe Photoshop 生成的 CMYK JPEG 样值反相，需补全 Decode 数组避免底色变全黑）
+			if !bytes.Contains(dictPart, []byte("/Decode")) {
 				lastDictEnd := bytes.LastIndex(dictPart, []byte(">>"))
 				if lastDictEnd != -1 {
 					var newDict []byte

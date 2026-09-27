@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,6 +31,7 @@ type Converter struct {
 	gsPath             string
 	pageWidthPoints    float64
 	pageHeightPoints   float64
+	customDimensions   bool
 	compatibilityLevel string
 	imageSearchDir     string
 	progress           ProgressHandler
@@ -49,6 +53,7 @@ func WithPageDimensions(widthPoints, heightPoints float64) Option {
 	return func(c *Converter) {
 		c.pageWidthPoints = widthPoints
 		c.pageHeightPoints = heightPoints
+		c.customDimensions = true
 	}
 }
 
@@ -116,23 +121,206 @@ func (c *Converter) reportProgress(step, total int, msg string) {
 	}
 }
 
-// PatchPS 读取 PS 字节流，修补图片引用路径并禁用 /psdefine
+// PSPageDimensions 页面尺寸 (pts) 与连版裁剪偏移
+type PSPageDimensions struct {
+	WidthPts  float64
+	HeightPts float64
+	OffsetX   float64
+	OffsetY   float64
+}
+
+// FindCJKFont 寻找系统或 Ghostscript 自带的中文字体文件 (TTF/TTC)
+func FindCJKFont(gsPath string) string {
+	candidates := []string{
+		// 1. Ghostscript 自带的 DroidSansFallback.ttf (最稳定，字库全，无嵌入版权限制)
+		filepath.Join(filepath.Dir(filepath.Dir(gsPath)), "share", "ghostscript", "Resource", "CIDFSubst", "DroidSansFallback.ttf"),
+		filepath.Join(filepath.Dir(filepath.Dir(gsPath)), "share", "ghostscript", "*", "Resource", "CIDFSubst", "DroidSansFallback.ttf"),
+		filepath.Join(filepath.Dir(filepath.Dir(gsPath)), "Resource", "CIDFSubst", "DroidSansFallback.ttf"),
+		"/opt/homebrew/share/ghostscript/Resource/CIDFSubst/DroidSansFallback.ttf",
+		"/opt/homebrew/share/ghostscript/*/Resource/CIDFSubst/DroidSansFallback.ttf",
+		"/usr/local/share/ghostscript/Resource/CIDFSubst/DroidSansFallback.ttf",
+		"/usr/share/ghostscript/Resource/CIDFSubst/DroidSansFallback.ttf",
+		// 2. Windows 常见中文字体
+		"C:\\Windows\\Fonts\\msyh.ttc",
+		"C:\\Windows\\Fonts\\simsun.ttc",
+		"C:\\Windows\\Fonts\\simhei.ttf",
+	}
+
+	// 检查当前用户 Home 目录下的 Fonts
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, "Library", "Fonts", "msyh.ttf"))
+		candidates = append(candidates, filepath.Join(home, "Library", "Fonts", "Microsoft", "msyh.ttf"))
+	}
+
+	// 3. 其它系统字体作为保底
+	candidates = append(candidates,
+		"/Library/Fonts/Microsoft/msyh.ttf",
+		"/System/Library/Fonts/Supplemental/Songti.ttc",
+		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+	)
+
+	for _, pattern := range candidates {
+		if strings.Contains(pattern, "*") {
+			matches, _ := filepath.Glob(pattern)
+			for _, m := range matches {
+				if fi, err := os.Stat(m); err == nil && !fi.IsDir() {
+					return m
+				}
+			}
+		} else {
+			if fi, err := os.Stat(pattern); err == nil && !fi.IsDir() {
+				return pattern
+			}
+		}
+	}
+	return ""
+}
+
+// GenerateCidfmap 为 Ghostscript 生成 CIDFont 映射表
+func GenerateCidfmap(tmpDir string, psData []byte, cjkFont string) error {
+	if cjkFont == "" {
+		return nil
+	}
+	reFounderFont := regexp.MustCompile(`/([A-Za-z0-9_\-]+)--(GBK1-0|GB-EUC-H)`)
+	matches := reFounderFont.FindAllSubmatch(psData, -1)
+	prefixes := make(map[string]bool)
+	for _, m := range matches {
+		prefixes[string(m[1])] = true
+	}
+	prefixes["FZBSK"] = true
+	prefixes["FZHTK"] = true
+	prefixes["FZSSK"] = true
+	prefixes["FZKTK"] = true
+	prefixes["FZFSK"] = true
+
+	var buf bytes.Buffer
+	buf.WriteString("%! cidfmap for Founder CJK fonts\n")
+	cleanPath := filepath.ToSlash(cjkFont)
+	for prefix := range prefixes {
+		fmt.Fprintf(&buf, "/%s << /FileType /TrueType /Path (%s) /SubfontID 0 /CSI [(GB1) 5] >> ;\n", prefix, cleanPath)
+	}
+	return os.WriteFile(filepath.Join(tmpDir, "cidfmap"), buf.Bytes(), 0644)
+}
+
+// DetectPSPageDimensions 探测 PS 文件的页面尺寸 (pts) 与连版裁剪偏移
+func DetectPSPageDimensions(psData []byte) PSPageDimensions {
+	defaultDims := PSPageDimensions{
+		WidthPts:  DefaultPageWidthPoints,
+		HeightPts: DefaultPageHeightPoints,
+		OffsetX:   0,
+		OffsetY:   0,
+	}
+
+	// 1. 探测缩放比例 (飞腾常为 72/742)
+	scale := 72.0 / 742.0
+	reScale := regexp.MustCompile(`(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+div\s+dup\s+neg\s+scale`)
+	if m := reScale.FindSubmatch(psData); len(m) > 2 {
+		num, _ := strconv.ParseFloat(string(m[1]), 64)
+		denom, _ := strconv.ParseFloat(string(m[2]), 64)
+		if denom > 0 {
+			scale = num / denom
+		}
+	}
+
+	// 2. 探测 Rect clip (裁剪区域，精准识别连版中的单版位置)
+	reClips := regexp.MustCompile(`(?m)^\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s+Rect[\s\r\n]+(?:gs[\s\r\n]+)?clip`)
+	clips := reClips.FindAllSubmatch(psData, -1)
+	if len(clips) >= 2 {
+		x1, _ := strconv.ParseFloat(string(clips[1][1]), 64)
+		y1, _ := strconv.ParseFloat(string(clips[1][2]), 64)
+		x2, _ := strconv.ParseFloat(string(clips[1][3]), 64)
+		y2, _ := strconv.ParseFloat(string(clips[1][4]), 64)
+		w := math.Abs(x2-x1) * scale
+		h := math.Abs(y2-y1) * scale
+		ox := math.Min(x1, x2) * scale
+		oy := math.Min(y1, y2) * scale
+		if w > 100 && h > 100 {
+			return PSPageDimensions{
+				WidthPts:  w,
+				HeightPts: h,
+				OffsetX:   ox,
+				OffsetY:   oy,
+			}
+		}
+	} else if len(clips) == 1 {
+		x1, _ := strconv.ParseFloat(string(clips[0][1]), 64)
+		y1, _ := strconv.ParseFloat(string(clips[0][2]), 64)
+		x2, _ := strconv.ParseFloat(string(clips[0][3]), 64)
+		y2, _ := strconv.ParseFloat(string(clips[0][4]), 64)
+		w := math.Abs(x2-x1) * scale
+		h := math.Abs(y2-y1) * scale
+		ox := math.Min(x1, x2) * scale
+		oy := math.Min(y1, y2) * scale
+		if w > 100 && h > 100 {
+			return PSPageDimensions{
+				WidthPts:  w,
+				HeightPts: h,
+				OffsetX:   ox,
+				OffsetY:   oy,
+			}
+		}
+	}
+
+	// 3. 回退到 BoundingBox
+	reBBox := regexp.MustCompile(`(?m)^%%(?:HiRes|Page)?BoundingBox:\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)`)
+	matches := reBBox.FindAllSubmatch(psData, -1)
+	for _, m := range matches {
+		x1, _ := strconv.ParseFloat(string(m[1]), 64)
+		y1, _ := strconv.ParseFloat(string(m[2]), 64)
+		x2, _ := strconv.ParseFloat(string(m[3]), 64)
+		y2, _ := strconv.ParseFloat(string(m[4]), 64)
+		w := math.Abs(x2 - x1)
+		h := math.Abs(y2 - y1)
+		if w > 100 && h > 100 {
+			return PSPageDimensions{
+				WidthPts:  w,
+				HeightPts: h,
+				OffsetX:   0,
+				OffsetY:   0,
+			}
+		}
+	}
+	return defaultDims
+}
+
+// PatchPS 读取 PS 字节流，修补图片引用路径、禁用 /psdefine 并注入方正发排环境兼容垫片
 func (c *Converter) PatchPS(psData []byte, searchDir string) ([]byte, PatchReport, error) {
 	patchedData, report := ResolveAndPatchImagePaths(psData, searchDir)
+	patchedData = InjectFounderPolyfill(patchedData)
 	return patchedData, report, nil
 }
 
-// RenderBasePDF 调用 Ghostscript 将修补后的 PS 渲染为基础 PDF
-func (c *Converter) RenderBasePDF(ctx context.Context, fixedPSPath, basePDFPath string) error {
+// RenderBasePDFWithOptions 调用 Ghostscript 将修补后的 PS 渲染为基础 PDF（支持自定义临时目录与页面几何参数）
+func (c *Converter) RenderBasePDFWithOptions(ctx context.Context, fixedPSPath, basePDFPath, tmpDir string, dims PSPageDimensions) error {
+	width := dims.WidthPts
+	if width <= 0 {
+		width = c.pageWidthPoints
+	}
+	height := dims.HeightPts
+	if height <= 0 {
+		height = c.pageHeightPoints
+	}
+
 	gsArgs := []string{
 		"-dBATCH", "-dNOPAUSE", "-dNOSAFER",
 		"-sDEVICE=pdfwrite",
-		fmt.Sprintf("-dDEVICEWIDTHPOINTS=%.2f", c.pageWidthPoints),
-		fmt.Sprintf("-dDEVICEHEIGHTPOINTS=%.2f", c.pageHeightPoints),
+		fmt.Sprintf("-sOutputFile=%s", basePDFPath),
+		fmt.Sprintf("-dDEVICEWIDTHPOINTS=%.2f", width),
+		fmt.Sprintf("-dDEVICEHEIGHTPOINTS=%.2f", height),
 		"-dFIXEDMEDIA",
 		fmt.Sprintf("-dCompatibilityLevel=%s", c.compatibilityLevel),
-		fmt.Sprintf("-sOutputFile=%s", basePDFPath),
-		fixedPSPath,
+	}
+
+	if tmpDir != "" {
+		gsArgs = append([]string{fmt.Sprintf("-I%s", tmpDir)}, gsArgs...)
+	}
+
+	if dims.OffsetX != 0 || dims.OffsetY != 0 {
+		gsArgs = append(gsArgs, "-c", fmt.Sprintf("<< /PageOffset [-%.2f -%.2f] >> setpagedevice", dims.OffsetX, dims.OffsetY), "-f", fixedPSPath)
+	} else {
+		gsArgs = append(gsArgs, fixedPSPath)
 	}
 
 	cmd := exec.CommandContext(ctx, c.gsPath, gsArgs...)
@@ -150,6 +338,14 @@ func (c *Converter) RenderBasePDF(ctx context.Context, fixedPSPath, basePDFPath 
 	}
 
 	return nil
+}
+
+// RenderBasePDF 调用 Ghostscript 将修补后的 PS 渲染为基础 PDF
+func (c *Converter) RenderBasePDF(ctx context.Context, fixedPSPath, basePDFPath string) error {
+	return c.RenderBasePDFWithOptions(ctx, fixedPSPath, basePDFPath, "", PSPageDimensions{
+		WidthPts:  c.pageWidthPoints,
+		HeightPts: c.pageHeightPoints,
+	})
 }
 
 // Convert 执行完整的 PS 转 PDF 流程
@@ -186,12 +382,21 @@ func (c *Converter) Convert(ctx context.Context, psPath, outputPDFPath string) (
 	fixedPS := filepath.Join(tmpDir, stem+"_fixed.ps")
 	basePDF := filepath.Join(tmpDir, stem+"_base.pdf")
 
-	// [1/4] 扫描图片引用并修补 PS
-	c.reportProgress(1, 4, "自动扫描图片并直接重定向到本地真实路径...")
+	// [1/4] 扫描图片引用并修补 PS，注入方正发排环境垫片与 CJK 字体映射
+	c.reportProgress(1, 4, "自动扫描图片并直接重定向到本地真实路径，注入发排环境垫片...")
 	psData, err := os.ReadFile(absPS)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read PS file: %w", err)
 	}
+
+	dims := DetectPSPageDimensions(psData)
+	if c.customDimensions {
+		dims.WidthPts = c.pageWidthPoints
+		dims.HeightPts = c.pageHeightPoints
+	}
+
+	cjkFont := FindCJKFont(c.gsPath)
+	_ = GenerateCidfmap(tmpDir, psData, cjkFont)
 
 	patchedData, patchReport, err := c.PatchPS(psData, searchDir)
 	if err != nil {
@@ -203,7 +408,7 @@ func (c *Converter) Convert(ctx context.Context, psPath, outputPDFPath string) (
 
 	// [2/4] Ghostscript 渲染基础 PDF
 	c.reportProgress(2, 4, "Ghostscript 渲染基础 PDF...")
-	if err := c.RenderBasePDF(ctx, fixedPS, basePDF); err != nil {
+	if err := c.RenderBasePDFWithOptions(ctx, fixedPS, basePDF, tmpDir, dims); err != nil {
 		return nil, err
 	}
 

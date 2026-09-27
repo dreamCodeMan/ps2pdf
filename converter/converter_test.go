@@ -133,3 +133,64 @@ func TestFindGS(t *testing.T) {
 		t.Errorf("expected non-empty Ghostscript path/command")
 	}
 }
+
+func TestInjectFounderPolyfill(t *testing.T) {
+	inputPS := []byte(`%!PS-Adobe-3.0
+%%Title: Test
+%%Creator: PS-Founder2.0 GBK FIT 4.0
+%%EndComments
+%%BeginProlog
+%%Page: 1 1
+fit_ps_dict begin 
+fitsetdef 
+BP
+72 742 div dup neg scale 0 -15931.678740 tr
+/patmatrix matrix currentmatrix def
+psdefine 
+0.000000 0.000000 22961.102362 15931.678740 Rect
+gs
+clip np
+`)
+
+	output := InjectFounderPolyfill(inputPS)
+
+	// 检查是否包含 Polyfill 字典与宏
+	if !bytes.Contains(output, []byte("/fit_ps_dict where")) {
+		t.Errorf("未能成功注入 fit_ps_dict 垫片")
+	}
+	if !bytes.Contains(output, []byte("/Rect")) {
+		t.Errorf("未能成功注入 Rect 宏定义")
+	}
+	if !bytes.Contains(output, []byte("/VT")) {
+		t.Errorf("未能成功注入 VT 宏定义")
+	}
+
+	// 必须保持首行 %!PS-Adobe-3.0 依然在最开头
+	if !bytes.HasPrefix(output, []byte("%!PS-Adobe-3.0\n")) {
+		t.Errorf("首行 DSC 标识被破坏: %s", string(output[:20]))
+	}
+}
+
+func TestDetectPSPageDimensions(t *testing.T) {
+	psData := []byte(`%!PS-Adobe-3.0
+72 742 div dup neg scale
+0.000000 0.000000 22961.102362 15931.678740 Rect clip
+1000.000000 2000.000000 12461.102362 17931.678740 Rect clip
+`)
+	dims := DetectPSPageDimensions(psData)
+	if dims.WidthPts <= 0 || dims.HeightPts <= 0 {
+		t.Fatalf("expected positive dimensions, got %+v", dims)
+	}
+}
+
+func TestResolveAndPatchImagePaths_PsdefineDef(t *testing.T) {
+	psInput := []byte("/psdefine { check check check } def\n (test.jpg) run\n")
+	patched, report := ResolveAndPatchImagePaths(psInput, t.TempDir())
+	if !report.PsdefinePatched {
+		t.Errorf("expected psdefine with def to be patched")
+	}
+	if !bytes.Contains(patched, []byte("/psdefine { } bd")) {
+		t.Errorf("psdefine patch content not found")
+	}
+}
+
